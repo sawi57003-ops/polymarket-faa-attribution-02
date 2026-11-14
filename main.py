@@ -51,6 +51,13 @@ def robust_sigma(prices):
 
 
 def forecast(market, horizon):
+    """One market's quantile rows: persistence center, spread grows sqrt(h).
+
+    The median (z=0) stays at the last observed price for every horizon;
+    the outer quantiles widen with sqrt(h) so the 4h-ahead spread is ~15x
+    the 1-minute spread. Rounding can only shrink a gap, never invert it,
+    so each row stays non-decreasing.
+    """
     prices = market["prices"]
     if not prices:
         raise ValueError(f"market {market.get('id')} has no prices")
