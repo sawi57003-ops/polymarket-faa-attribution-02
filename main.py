@@ -1,88 +1,115 @@
 #!/usr/bin/env python3
-"""polymarket-faa-attribution-02 entry: quantile forecasts for Polymarket Yes prices.
+"""FAA outage attribution forecaster for Polymarket Yes prices (make.fun entry).
 
-Same task as -01 (the FAA outage attribution markets), on the earlier dates.
-Model: persistence center + a per-market spread that adapts to that market's
-own recent movement. The house baseline uses a fixed spread (sigma 0.0025
-per sqrt-minute), which is far too wide for these slow-moving markets --
-the realized 4h moves are much smaller. Instead, estimate each market's
-per-minute sigma robustly from the median absolute 60-minute price change
-over the trailing 24h (MAD -> stdev), floored at 0.0005 and capped at
-0.0025. Quantiles: q_tau(h) = clamp(x + z_tau * sigma * sqrt(h), 0, 1).
-Backtested on the 6 NVIDIA-CEO practice cases with realized Polymarket
-futures: pinball 0.00293 vs the house baseline's 0.00364 (~80%), and it
-adapts automatically if the FAA markets move faster than the practice
-event's markets. Pure stdlib, no network, deterministic.
+Every market in a case is one Yes/No question about how the November 2026
+FAA outage will officially be explained. This program looks at each
+market's last three days of minute prices and, for the next four hours,
+says where the price is likely to sit, at five confidence levels.
+
+The forecast is deliberately simple and honest. The middle of the range
+just stays where the price is now: these markets barely move most of the
+time, so the last price is the best guess for the next price. What grows
+with time is the width of the range, and that width is learned from the
+market itself instead of being fixed. For each market we look at how far
+its price moved over one-hour stretches during the last day, take the
+typical size of those moves, and turn it into a per-minute wobble. A
+market that has been jumping around gets a wide range; a market that has
+been sitting still gets a narrow one. The range is then spread over the
+horizon with the square root of time, which is how far a price that
+wanders randomly is expected to drift.
+
+On the six practice cases this scores a pinball loss near 0.0029, against
+about 0.0036 for a fixed-width baseline, so roughly four fifths of the
+baseline loss. The program uses only the standard library, talks to no
+network, and always gives the same answer for the same input.
+
+The entry point is main(): it reads every .in case and writes the matching
+.out answer, one JSON object per case, with a trailing newline.
 """
 import json
 import math
 import os
 import statistics
 
-INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
-OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+# Where cases come from and where answers go; overridable for local runs.
+IN_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+OUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-Z = [-1.644854, -0.67449, 0.0, 0.67449, 1.644854]
-SIGMA_MIN = 0.0005
-SIGMA_MAX = 0.0025
-VOL_WINDOW = 1440   # minutes of trailing history for the vol estimate
-VOL_LAG = 60        # minutes over which price changes are measured
+# The five confidence levels we report, as normal-distribution z-scores.
+ZSCORES = (-1.644854, -0.67449, 0.0, 0.67449, 1.644854)
+
+# Bounds on the per-minute wobble, so a dead-quiet market still gets a
+# usable range and a wild one cannot blow the range up without limit.
+SIG_LO = 0.0005
+SIG_HI = 0.0025
+
+# How much history feeds the wobble estimate, and the stretch each move
+# is measured over, both in minutes.
+TRAIL = 1440
+LAG = 60
 
 
-def price6(x):
-    """Clamp to [0,1] and round to 6 decimals (0, never -0)."""
-    return round(min(1.0, max(0.0, x)) * 1e6) / 1e6 + 0
+def round6(value):
+    """Pin a price into [0, 1] and keep six decimals, never returning -0."""
+    clamped = max(0.0, min(1.0, value))
+    return round(clamped * 1e6) / 1e6 + 0
 
 
-def robust_sigma(prices):
-    """Per-minute sigma from the median absolute VOL_LAG-minute change.
+def sigma_per_minute(prices):
+    """How much one market's price typically wobbles in a single minute.
 
-    MAD-based so a few large jumps do not inflate the spread; the floor
-    keeps the quantiles from collapsing to a single point on a flat
-    market, and the cap keeps a volatile market from exploding them.
+    Take the absolute moves over one-hour stretches across the last day,
+    find the middle one, and rescale it into a per-minute spread. Using
+    the middle move instead of the average keeps a couple of wild jumps
+    from stretching the whole range, and the bounds keep the answer
+    sensible on markets that barely move at all.
     """
-    w = prices[-VOL_WINDOW:]
-    if len(w) <= VOL_LAG:
-        return SIGMA_MIN
-    changes = [abs(w[i] - w[i - VOL_LAG]) for i in range(VOL_LAG, len(w))]
-    med = statistics.median(changes)
-    sig = med / 0.6745 / math.sqrt(VOL_LAG)
-    return min(SIGMA_MAX, max(SIGMA_MIN, sig))
+    recent = prices[-TRAIL:]
+    if len(recent) <= LAG:
+        return SIG_LO
+    moves = [abs(recent[i] - recent[i - LAG]) for i in range(LAG, len(recent))]
+    middle = statistics.median(moves)
+    per_min = middle / 0.6745 / math.sqrt(LAG)
+    return min(SIG_HI, max(SIG_LO, per_min))
 
 
-def forecast(market, horizon):
-    """One market's quantile rows: persistence center, spread grows sqrt(h).
+def market_quantiles(market, horizon):
+    """One market's five-level forecasts for every minute of the horizon.
 
-    The median (z=0) stays at the last observed price for every horizon;
-    the outer quantiles widen with sqrt(h) so the 4h-ahead spread is ~15x
-    the 1-minute spread. Rounding can only shrink a gap, never invert it,
-    so each row stays non-decreasing.
+    The middle level never leaves the last seen price. The other levels
+    sit that price plus or minus the wobble times the square root of the
+    minutes ahead, so the range opens up the further out we look. A
+    rounding step can only narrow a gap, never flip it, which keeps
+    every row in order from the lowest level to the highest.
     """
-    prices = market["prices"]
-    if not prices:
-        raise ValueError(f"market {market.get('id')} has no prices")
-    x = prices[-1]
-    sig = robust_sigma(prices)
+    history = market["prices"]
+    if not history:
+        raise ValueError("market %s has no prices" % market.get("id"))
+    last = history[-1]
+    vol = sigma_per_minute(history)
     rows = []
-    for h in range(1, horizon + 1):
-        s = sig * math.sqrt(h)
-        rows.append([price6(x + z * s) for z in Z])
+    for step in range(1, horizon + 1):
+        width = vol * math.sqrt(step)
+        rows.append([round6(last + z * width) for z in ZSCORES])
     return rows
 
 
 def main():
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    names = sorted(f for f in os.listdir(INPUT_DIR) if f.endswith(".in"))
-    for name in names:
+    """Read every case in IN_DIR and write one answer file per case."""
+    os.makedirs(OUT_DIR, exist_ok=True)
+    for name in sorted(os.listdir(IN_DIR)):
+        if not name.endswith(".in"):
+            continue
         case_id = name[:-3]
-        with open(os.path.join(INPUT_DIR, name), "r") as fh:
-            case = json.load(fh)
+        with open(os.path.join(IN_DIR, name)) as src:
+            case = json.load(src)
         horizon = case["horizon_minutes"]
         forecasts = [
-            {"id": m["id"], "q": forecast(m, horizon)} for m in case["markets"]
+            {"id": m["id"], "q": market_quantiles(m, horizon)}
+            for m in case["markets"]
         ]
-        with open(os.path.join(OUTPUT_DIR, case_id + ".out"), "w") as fh:
-            fh.write(json.dumps({"forecasts": forecasts}) + "\n")
+        with open(os.path.join(OUT_DIR, case_id + ".out"), "w") as dst:
+            dst.write(json.dumps({"forecasts": forecasts}) + "\n")
 
 
 if __name__ == "__main__":

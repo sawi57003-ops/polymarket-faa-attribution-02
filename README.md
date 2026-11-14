@@ -1,25 +1,29 @@
 # polymarket-faa-attribution-02
 
-Forecast, minute by minute and 4 hours ahead, the Yes price of every
-Polymarket market for how the 13 Nov 2026 FAA outage gets officially
-attributed.
+Quantile forecasts for Polymarket Yes prices on how the November 2026 FAA
+outage will officially be attributed. For each market and each of the 240
+minutes after the checkpoint, `main.py` writes five quantiles (5%, 25%,
+50%, 75%, 95%) of that minute's price.
 
 ## Model
 
-Persistence center + a per-market spread that adapts to that market's own
-recent movement. Each market's per-minute sigma is estimated robustly
-from the median absolute 60-minute price change over the trailing 24h
-(MAD -> stdev), floored at 0.0005 and capped at 0.0025. Quantiles:
-`q_tau(h) = clamp(x + z_tau * sigma * sqrt(h), 0, 1)`.
+- **Centre:** the last observed price. These markets barely move most of
+  the time, so persistence is the best guess for the median.
+- **Spread:** learned per market, not fixed. Take the absolute price moves
+  over one-hour stretches across the trailing 24 hours, take their median,
+  and rescale it (median absolute deviation to a standard deviation) into
+  a per-minute volatility, floored at 0.0005 and capped at 0.0025.
+- **Quantiles:** centre plus the normal z-score for each level times the
+  volatility times the square root of the minutes ahead, clamped to
+  [0, 1] and rounded to six decimals.
 
-Backtested on the 6 NVIDIA-CEO practice cases with realized Polymarket
-futures: pinball 0.00293 vs the house baseline's 0.00364 (~80% of house).
-Mean reversion hurts; the adaptive sigma is what wins.
+Practice backtest: pinball loss about 0.0029, against about 0.0036 for a
+fixed-spread baseline (roughly 80% of the baseline loss).
 
 ## Run
 
 ```sh
-python3 main.py   # reads /input/*.in, writes /output/*.out
+MAKEFUN_INPUT_DIR=<cases> MAKEFUN_OUTPUT_DIR=<out> python3 main.py
 ```
 
-Pure stdlib, no network, deterministic. MIT licensed.
+Pure standard library, no network, deterministic.
